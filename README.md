@@ -37,3 +37,5 @@ The sphinxlink extensions provides those functions:
     > SELECT * FROM sphinx_meta('myconn');
     > SELECT sphinx_disconnect('myconn');
     
+## Authors
+Dmitry Voronin <carriingfate92@yandex.ru>
