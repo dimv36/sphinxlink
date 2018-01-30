@@ -18,7 +18,7 @@ PG_MODULE_MAGIC;
 #define MAXHOSTLEN 1024
 #define NUMCONN 32
 
-#define FREE_STR(_ptr, _freed) \
+#define safe_free(_ptr, _freed) \
 do { \
 	if ((_ptr) && (_freed)) \
 		pfree((_ptr)); \
@@ -119,11 +119,10 @@ sphinx_connect(PG_FUNCTION_ARGS)
 	rconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext,
 											  sizeof(remoteConn));
 
-//	elog(NOTICE, "conname: %s, host: %s, port: %d", conname, host, port);
-
 	conn = mysql_init(NULL);
 	if (!conn)
 	{
+		safe_free(rconn, true);
 		ereport(ERROR,
 				(errcode(ERRCODE_INTERNAL_ERROR),
 				 errmsg("failed to initialise MySQL connection object")));
@@ -139,6 +138,7 @@ sphinx_connect(PG_FUNCTION_ARGS)
 
 		msg = pstrdup(mysql_error(conn));
 		mysql_close(conn);
+		safe_free(rconn, true);
 
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
@@ -167,7 +167,8 @@ sphinx_disconnect(PG_FUNCTION_ARGS)
 	SPHINX_GETCONN;
 
 	mysql_close(conn);
-	if (rconn)0861
+	conn = NULL;
+	if (rconn)
 	{
 		deleteConnection(conname);
 		pfree(rconn);
@@ -190,6 +191,7 @@ sphinx_connections(PG_FUNCTION_ARGS)
 	int					max_calls;
 	TupleDesc			tupdesc;
 	AttInMetadata	   *attinmeta;
+	char			   *values[3];
 
 	/* stuff done only on the first call of the function */
 	if (SRF_IS_FIRSTCALL())
@@ -239,12 +241,12 @@ sphinx_connections(PG_FUNCTION_ARGS)
 
 	if (call_cntr < max_calls)		/* do when there is more left to send */
 	{
-		char	  **values;
 		HeapTuple	tuple;
 		Datum		result;
 		remoteConnHashEnt *entry;
 		HASH_SEQ_STATUS status;
 		int			i = 0;
+		int			j = 0;
 
 		hash_seq_init(&status, remoteConnHash);
 		while ((entry = (remoteConnHashEnt *) hash_seq_search(&status)) != NULL)
@@ -259,23 +261,15 @@ sphinx_connections(PG_FUNCTION_ARGS)
 		 * This should be an array of C strings which will
 		 * be processed later by the type input functions.
 		 */
-		values = (char **) palloc(3 * sizeof(char *));
-		values[0] = (char *) pstrdup(entry->name);
-		values[1] = (char *) pstrdup(entry->rconn->host);
-		values[2] = psprintf("%d", entry->rconn->port);
-		/* build a tuple */
-		tuple = BuildTupleFromCStrings(attinmeta, values);
+		values[j++] = psprintf("%s", entry->name);
+		values[j++] = psprintf("%s", entry->rconn->host);
+		values[j++] = psprintf("%d", entry->rconn->port);
 
 		hash_seq_term(&status);
 
-		/* make the tuple into a datum */
+		/* build a tuple */
+		tuple = BuildTupleFromCStrings(funcctx->attinmeta, values);
 		result = HeapTupleGetDatum(tuple);
-
-		/* clean up (this is not really necessary) */
-		pfree(values[0]);
-		pfree(values[1]);
-		pfree(values[2]);
-		pfree(values);
 
 		SRF_RETURN_NEXT(funcctx, result);
 	}
@@ -329,26 +323,16 @@ sphinx_query(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(tconname, 0);
 	PG_FREE_IF_COPY(tquery, 1);
 
-//	if (!mysql_ping(conn))
-//	{
-//		char	   *err = pstrdup(mysql_error(conn));
-
-//		FREE_STR(encoded_query, freed);
-//		ereport(ERROR,
-//				(errcode(ERRCODE_CONNECTION_FAILURE),
-//				 errmsg("Error when reconnecting to Sphinx: %s", err)));
-//	}
-
 	if (mysql_query(conn, encoded_query) != 0)
 	{
 		char	   *err = pstrdup(mysql_error(conn));
 
-		FREE_STR(encoded_query, freed);
+		safe_free(encoded_query, freed);
 		ereport(ERROR,
 				(errcode(ERRCODE_CONNECTION_FAILURE),
 				 errmsg("Error when send query to Sphinx: %s", err)));
 	}
-	FREE_STR(encoded_query, freed);
+	safe_free(encoded_query, freed);
 	if ((res = mysql_store_result(conn)) == NULL)
 	{
 		char	    *err = pstrdup(mysql_error(conn));
@@ -431,7 +415,6 @@ sphinx_query(PG_FUNCTION_ARGS)
 				{
 					encvalue = toMyDatabaseEncoding(value, &freed);
 					values[i] = pstrdup(encvalue);
-					//FREE_STR(encvalue, freed);
 				}
 			}
 
@@ -565,11 +548,11 @@ sphinx_meta(PG_FUNCTION_ARGS)
 
 			encvalue = toMyDatabaseEncoding(row[0], &freed);
 			values[0] = (char *) pstrdup(encvalue);
-			FREE_STR(encvalue, freed);
+			safe_free(encvalue, freed);
 
 			encvalue = toMyDatabaseEncoding(row[1], &freed);
 			values[1] = (char *) pstrdup(encvalue);
-			FREE_STR(encvalue, freed);
+			safe_free(encvalue, freed);
 
 			tuple = BuildTupleFromCStrings(attinmeta, values);
 
@@ -656,14 +639,18 @@ connectionExists(const char *name)
 	char	   *key;
 
 	if (!remoteConnHash)
+	{
 		remoteConnHash = createConnHash();
+		return false;
+	}
 
 	key = pstrdup(name);
 	truncate_identifier(key, strlen(key), true);
 	hash_search(remoteConnHash, key,
-				HASH_ENTER, &found);
+				HASH_FIND, &found);
 	return found;
 }
+
 
 void
 deleteConnection(const char *name)
