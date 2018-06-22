@@ -434,8 +434,11 @@ sphinx_query(PG_FUNCTION_ARGS)
 			tuple = BuildTupleFromCStrings(attinmeta, values);
 
 			/* Free results */
-			for (i = 0; i < nfields; i++)
-				pfree(values[i]);
+			for (i = 0; i < nfields; i++){
+				if (values[i] != NULL) {
+					pfree(values[i]);
+				}
+			}
 
 			tuplestore_puttuple(tupstore, tuple);
 		}
