@@ -120,7 +120,7 @@ sphinx_connect(PG_FUNCTION_ARGS)
 	PG_FREE_IF_COPY(tconname, 0);
 	PG_FREE_IF_COPY(thost, 1);
 	PG_FREE_IF_COPY(tuser, 3);
-	PG_FREE_IF_COPY(tpassword, 3);
+	PG_FREE_IF_COPY(tpassword, 4);
 	PG_FREE_IF_COPY(tdatabase, 5);
 
 	if (connectionExists(conname))
