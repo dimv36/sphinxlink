@@ -1,10 +1,10 @@
 -- complain if script is sourced in psql, rather than via CREATE EXTENSION
 \echo Use "CREATE EXTENSION sphinxlink" to load this file. \quit
 
-CREATE FUNCTION sphinx_connect(text, text DEFAULT '127.0.0.1', int DEFAULT 9306)
+CREATE FUNCTION sphinx_connect(text, text DEFAULT '127.0.0.1', int DEFAULT 9306, text DEFAULT NULL, text DEFAULT NULL, text DEFAULT NULL)
 RETURNS text
 AS 'MODULE_PATHNAME','sphinx_connect'
-LANGUAGE C STRICT;
+LANGUAGE C;
 
 CREATE FUNCTION sphinx_disconnect(text)
 RETURNS text

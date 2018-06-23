@@ -95,8 +95,14 @@ sphinx_connect(PG_FUNCTION_ARGS)
 {
 	text	   *tconname = PG_GETARG_TEXT_PP(0);
 	text	   *thost = PG_GETARG_TEXT_PP(1);
+	text	   *tuser = PG_GETARG_TEXT_PP(3);
+	text	   *tpassword = PG_GETARG_TEXT_PP(4);
+	text	   *tdatabase = PG_GETARG_TEXT_PP(5);
 	char	   *conname = NULL;
 	char	   *host = NULL;
+	char	   *user = NULL;
+	char	   *password = NULL;
+	char	   *database = NULL;
 	int			port;
 	MYSQL	   *conn = NULL;
 	remoteConn *rconn = NULL;
@@ -106,10 +112,16 @@ sphinx_connect(PG_FUNCTION_ARGS)
 
 	conname = text_to_cstring(tconname);
 	host = text_to_cstring(thost);
+	user = text_to_cstring(tuser);
+	password = text_to_cstring(tpassword);
+	database = text_to_cstring(tdatabase);
 	port = PG_GETARG_INT32(2);
 
 	PG_FREE_IF_COPY(tconname, 0);
 	PG_FREE_IF_COPY(thost, 1);
+	PG_FREE_IF_COPY(tuser, 3);
+	PG_FREE_IF_COPY(tpassword, 4);
+	PG_FREE_IF_COPY(tdatabase, 5);
 
 	if (connectionExists(conname))
 		ereport(ERROR,
@@ -132,7 +144,7 @@ sphinx_connect(PG_FUNCTION_ARGS)
 	mysql_options(conn, MYSQL_SET_CHARSET_NAME, "UTF8");
 	mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
 
-	if (!mysql_real_connect(conn, host, NULL, NULL, NULL, port, NULL, 0))
+	if (!mysql_real_connect(conn, host, user, password, database, port, NULL, 0))
 	{
 		char	   *msg;
 
@@ -422,8 +434,11 @@ sphinx_query(PG_FUNCTION_ARGS)
 			tuple = BuildTupleFromCStrings(attinmeta, values);
 
 			/* Free results */
-			for (i = 0; i < nfields; i++)
-				pfree(values[i]);
+			for (i = 0; i < nfields; i++){
+				if (values[i] != NULL) {
+					pfree(values[i]);
+				}
+			}
 
 			tuplestore_puttuple(tupstore, tuple);
 		}
