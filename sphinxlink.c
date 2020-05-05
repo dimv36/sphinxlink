@@ -218,7 +218,7 @@ sphinx_connections(PG_FUNCTION_ARGS)
 		 * generate attribute metadata needed later to produce tuples from raw
 		 * C strings
 		 */
-		tupdesc = CreateTemplateTupleDesc(3, false);
+		tupdesc = CreateTemplateTupleDesc(3);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "connname",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "host",
@@ -508,7 +508,7 @@ sphinx_meta(PG_FUNCTION_ARGS)
 		 * generate attribute metadata needed later to produce tuples from raw
 		 * C strings
 		 */
-		tupdesc = CreateTemplateTupleDesc(2, false);
+		tupdesc = CreateTemplateTupleDesc(2);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "varname",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "value",
