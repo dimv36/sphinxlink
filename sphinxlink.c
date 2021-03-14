@@ -423,7 +423,10 @@ sphinx_query(PG_FUNCTION_ARGS)
 
 			/* Free results */
 			for (i = 0; i < nfields; i++)
-				pfree(values[i]);
+			{
+				if (values[i])
+					pfree(values[i]);
+			}
 
 			tuplestore_puttuple(tupstore, tuple);
 		}
