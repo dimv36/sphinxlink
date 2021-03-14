@@ -2,7 +2,7 @@ MODULE_big = sphinxlink
 OBJS = sphinxlink.o
 
 EXTENSION = sphinxlink
-DATA = sphinxlink--1.0.sql
+DATA = sphinxlink--1.1.sql
 
 MYSQL_CONFIG = mysql_config
 PG_CPPFLAGS := $(shell $(MYSQL_CONFIG) --include)
