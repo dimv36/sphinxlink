@@ -75,6 +75,7 @@ do { \
 
 
 /* Static functions declaration */
+static TupleDesc createTemplateTupleDescImpl(int nargs);
 static remoteConn *getConnectionByName(const char *name);
 static HTAB *createConnHash(void);
 static void createNewConnection(const char *name, remoteConn *rconn);
@@ -218,7 +219,7 @@ sphinx_connections(PG_FUNCTION_ARGS)
 		 * generate attribute metadata needed later to produce tuples from raw
 		 * C strings
 		 */
-		tupdesc = CreateTemplateTupleDesc(3, false);
+		tupdesc = createTemplateTupleDescImpl(3);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "connname",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "host",
@@ -511,7 +512,7 @@ sphinx_meta(PG_FUNCTION_ARGS)
 		 * generate attribute metadata needed later to produce tuples from raw
 		 * C strings
 		 */
-		tupdesc = CreateTemplateTupleDesc(2, false);
+		tupdesc = createTemplateTupleDescImpl(2);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "varname",
 						   TEXTOID, -1, 0);
 		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "value",
@@ -579,6 +580,17 @@ sphinx_meta(PG_FUNCTION_ARGS)
 			mysql_free_result(fctx->res);
 		SRF_RETURN_DONE(funcctx);
 	}
+}
+
+
+TupleDesc
+createTemplateTupleDescImpl(int nargs)
+{
+#if (PG_VERSION_NUM >= 120000)
+	return CreateTemplateTupleDesc(nargs);
+#else
+	return CreateTemplateTupleDesc(nargs, false);
+#endif
 }
 
 
