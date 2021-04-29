@@ -10,13 +10,15 @@ This is extension for PostgreSQL which allows you:
 The SphinxSearch client message protocol is the same as mysql, so, you need:
 * mysql-client development package (or mariadb-client development package)
 * postgresql development package
+* gcc compiler
+* make utility
 
 Typical installation procedure may look like this:
     
     $ git clone https://github.com/dimv36/sphinxlink.git
     $ cd sphinxlink
-    $ make USE_PGXS=1
-    $ sudo make USE_PGXS=1 install
+    $ make
+    $ sudo make install
     $ psql DB -c "CREATE EXTENSION sphinxlink;"
 
 ## HOWTO
