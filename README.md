@@ -1,7 +1,7 @@
 # sphinxlink
 
 This is extension for PostgreSQL which allows you:
-* Connect to SphinxSearch;
+* Connect to SphinxSearch / ManticoreSearch;
 * Execute any search queries and get results as PostgreSQL table;
 * Get Meta information after each Sphinx search query.
 
