@@ -23,12 +23,13 @@ Typical installation procedure may look like this:
 
 ## HOWTO
 
-The sphinxlink extensions provides those functions:
+The `sphinxlink` extensions provides those functions:
 
-* sphinx_connect(conname text, host text DEFAULT '127.0.0.1', port integer DEFAULT 9306) - open connection to SphinxSearch with connection name conname;
-* sphinx_query(conname text, query text) - execute query on SphinxSearch connection and get results as table in dblink style (see examples);
-* sphinx_meta(conname text, OUT varname text, OUT value text) - get meta inforation about the last search query (it just executes SHOW META query on SphinxSearch and return table-based result);
-* sphinx_connections(OUT conname text, OUT host text, OUT port integer) - get information about all opened connections in this session;
+* `sphinx_connect(conname text, host text DEFAULT '127.0.0.1', port integer DEFAULT 9306)` - opens connection to SphinxSearch with connection name `conname`;
+* `sphinx_query(conname text, query text)` - execute query on SphinxSearch connection and get results as table in dblink style (see examples);
+* `sphinx_query_params(host text, port integer, query text)` - opens connection to SphinxSearch (if not opened) and executes query;
+* `sphinx_meta(conname text, OUT varname text, OUT value text)` - get meta inforation about the last search query (it just executes `SHOW META` query on SphinxSearch and return table-based result);
+* `sphinx_connections(OUT conname text, OUT host text, OUT port integer)` - get information about all opened connections in this session;
 * sphinx_disconnect(conname text) - close connection to SphinxSearch by name conname.
 
 ## Examples
