@@ -25,3 +25,8 @@ CREATE FUNCTION sphinx_meta(conname text, OUT varname text, OUT value text)
 RETURNS SETOF RECORD
 AS 'MODULE_PATHNAME', 'sphinx_meta'
 LANGUAGE C STRICT;
+
+CREATE FUNCTION sphinx_query_params(text, int, text)
+RETURNS SETOF record
+AS 'MODULE_PATHNAME', 'sphinx_query_params'
+LANGUAGE C STRICT;

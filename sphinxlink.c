@@ -78,7 +78,7 @@ do { \
 static TupleDesc createTemplateTupleDescImpl(int nargs);
 static remoteConn *getConnectionByName(const char *name);
 static HTAB *createConnHash(void);
-static void createNewConnection(const char *name, remoteConn *rconn);
+static void createNewConnection(const char *name, const char *host, const int port);
 static bool connectionExists(const char *name);
 static void deleteConnection(const char *name);
 static char *toMyDatabaseEncoding(const char *value, bool *freed);
@@ -99,9 +99,6 @@ sphinx_connect(PG_FUNCTION_ARGS)
 	char	   *conname = NULL;
 	char	   *host = NULL;
 	int			port;
-	MYSQL	   *conn = NULL;
-	remoteConn *rconn = NULL;
-	int			reconnect = 1;
 
 	SPHINX_INIT;
 
@@ -117,39 +114,7 @@ sphinx_connect(PG_FUNCTION_ARGS)
 				(errcode(ERRCODE_DUPLICATE_OBJECT),
 				 errmsg("duplicate connection name")));
 
-	rconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext,
-											  sizeof(remoteConn));
-
-	conn = mysql_init(NULL);
-	if (!conn)
-	{
-		safe_free(rconn, true);
-		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("failed to initialise MySQL connection object")));
-	}
-
-	/* Sphinx only works with UTF8, so make connection with it */
-	mysql_options(conn, MYSQL_SET_CHARSET_NAME, "UTF8");
-	mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
-
-	if (!mysql_real_connect(conn, host, NULL, NULL, NULL, port, NULL, 0))
-	{
-		char	   *msg;
-
-		msg = pstrdup(mysql_error(conn));
-		mysql_close(conn);
-		safe_free(rconn, true);
-
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("failed to connect to Sphinx: %s", msg)));
-	}
-
-	rconn->conn = conn;
-	snprintf(rconn->host, MAXHOSTLEN - 1, "%s", host);
-	rconn->port = port;
-	createNewConnection(conname, rconn);
+	createNewConnection(conname, host, port);
 
 	PG_RETURN_TEXT_P(cstring_to_text("OK"));
 }
@@ -444,6 +409,188 @@ sphinx_query(PG_FUNCTION_ARGS)
 }
 
 
+PG_FUNCTION_INFO_V1(sphinx_query_params);
+Datum
+sphinx_query_params(PG_FUNCTION_ARGS)
+{
+	text			   *thost = PG_GETARG_TEXT_PP(0);
+	int					port = PG_GETARG_INT32(1);
+	text			   *tquery = PG_GETARG_TEXT_PP(2);
+	StringInfoData		conname;
+	char			   *host = NULL;
+	remoteConn		   *rconn = NULL;
+	MYSQL			   *conn = NULL;
+	MYSQL_RES		   *res = NULL;
+	char			   *query = NULL;
+	int					ntuples;
+	int					nfields;
+	TupleDesc			tupdesc;
+	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
+	bool				freed;
+	char			   *encoded_query = NULL;
+
+	/* check to see if query supports us returning a tuplestore */
+	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("set-valued function called in context that cannot accept a set")));
+	if (!(rsinfo->allowedModes & SFRM_Materialize))
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("materialize mode required, but it is not allowed in this context")));
+
+	/* let the executor know we're sending back a tuplestore */
+	rsinfo->returnMode = SFRM_Materialize;
+
+	/* caller must fill these to return a non-empty result */
+	rsinfo->setResult = NULL;
+	rsinfo->setDesc = NULL;
+
+	initStringInfo(&conname);
+
+	SPHINX_INIT;
+
+	host = text_to_cstring(thost);
+	appendStringInfo(&conname, "sph-%s-%d", host, port);
+
+	if (!(rconn = getConnectionByName(conname.data)))
+	{
+		createNewConnection(conname.data, host, port);
+		rconn = getConnectionByName(conname.data);
+	}
+	if (strcmp(rconn->host, host) || (rconn->port != port))
+	{
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("connection with name \"%s\" already exists, but creadentials are different", conname.data)));
+	}
+
+	conn = rconn->conn;
+	query = text_to_cstring(tquery);
+	encoded_query = toUTF8Encoding(query, &freed);
+
+	PG_FREE_IF_COPY(thost, 0);
+	PG_FREE_IF_COPY(tquery, 2);
+
+	if (mysql_query(conn, encoded_query) != 0)
+	{
+		char	   *err = pstrdup(mysql_error(conn));
+
+		safe_free(encoded_query, freed);
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("Error when send query to Sphinx: %s", err)));
+	}
+	safe_free(encoded_query, freed);
+	if ((res = mysql_store_result(conn)) == NULL)
+	{
+		char	    *err = pstrdup(mysql_error(conn));
+
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("Error storing results: %s", err)));
+	}
+	ntuples = mysql_num_rows(res);
+	nfields = mysql_num_fields(res);
+
+	switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+	{
+		case TYPEFUNC_COMPOSITE:
+			/* success */
+			break;
+		case TYPEFUNC_RECORD:
+			/* failed to determine actual type of RECORD */
+			ereport(ERROR,
+					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+					 errmsg("function returning record called in context "
+							"that cannot accept type record")));
+			break;
+		default:
+			/* result type isn't composite */
+			elog(ERROR, "return type must be a row type");
+			break;
+	}
+
+	/* make sure we have a persistent copy of the tupdesc */
+	tupdesc = CreateTupleDescCopy(tupdesc);
+
+	/*
+	 * check result and tuple descriptor have the same number of columns
+	 */
+	if (nfields != tupdesc->natts)
+	{
+		if (!ntuples)
+			PG_RETURN_NULL();
+
+		ereport(ERROR,
+				(errcode(ERRCODE_DATATYPE_MISMATCH),
+				 errmsg("remote query result rowtype does not match "
+						"the specified FROM clause rowtype")));
+	}
+
+	if (ntuples > 0)
+	{
+		AttInMetadata	   *attinmeta;
+		Tuplestorestate	   *tupstore;
+		MYSQL_ROW			row;
+		char			  **values;
+		MemoryContext		oldcontext;
+
+		attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+		oldcontext = MemoryContextSwitchTo(
+									rsinfo->econtext->ecxt_per_query_memory);
+		tupstore = tuplestore_begin_heap(true, false, work_mem);
+		rsinfo->setDesc = tupdesc;
+		rsinfo->setResult = tupstore;
+		MemoryContextSwitchTo(oldcontext);
+
+		values = (char **) palloc(nfields * sizeof(char *));
+
+		/* put all tuples into the tuplestore */
+		while ((row = mysql_fetch_row(res)))
+		{
+			int			i;
+			HeapTuple	tuple;
+
+			for (i = 0; i < nfields; i++)
+			{
+				char *value = row[i];
+				char *encvalue = NULL;
+
+				if (value == NULL)
+					values[i] = NULL;
+				else
+				{
+					encvalue = toMyDatabaseEncoding(value, &freed);
+					values[i] = pstrdup(encvalue);
+				}
+			}
+
+			/* build the tuple and put it into the tuplestore. */
+			tuple = BuildTupleFromCStrings(attinmeta, values);
+
+			/* Free results */
+			for (i = 0; i < nfields; i++)
+			{
+				if (values[i])
+					pfree(values[i]);
+			}
+
+			tuplestore_puttuple(tupstore, tuple);
+		}
+
+		pfree(values);
+
+		if (res)
+			mysql_free_result(res);
+
+		/* clean up and return the tuplestore */
+		tuplestore_donestoring(tupstore);
+	}
+	return (Datum) 0;
+}
+
 PG_FUNCTION_INFO_V1(sphinx_meta);
 Datum
 sphinx_meta(PG_FUNCTION_ARGS)
@@ -628,15 +775,55 @@ createConnHash(void)
 
 
 void
-createNewConnection(const char *name, remoteConn *rconn)
+createNewConnection(const char *name,
+					const char *host,
+					const int port)
 {
 	remoteConnHashEnt *hentry;
-	bool		found;
-	char	   *key;
+	bool			found;
+	char		   *key;
+	MYSQL		   *conn = NULL;
+	remoteConn	   *rconn = NULL;
+	int				reconnect = 1;
 
 	if (!remoteConnHash)
 		remoteConnHash = createConnHash();
 
+	conn = mysql_init(NULL);
+	if (!conn)
+	{
+		safe_free(rconn, true);
+		ereport(ERROR,
+				(errcode(ERRCODE_INTERNAL_ERROR),
+				 errmsg("failed to initialise MySQL connection object")));
+	}
+
+	/* Sphinx only works with UTF8, so make connection with it */
+	mysql_options(conn, MYSQL_SET_CHARSET_NAME, "UTF8");
+	mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+
+	if (!mysql_real_connect(conn, host, NULL, NULL, NULL, port, NULL, 0))
+	{
+		char	   *msg;
+
+		msg = pstrdup(mysql_error(conn));
+		mysql_close(conn);
+		safe_free(rconn, true);
+
+		ereport(ERROR,
+				(errcode(ERRCODE_CONNECTION_FAILURE),
+				 errmsg("failed to connect to Sphinx: %s", msg)));
+	}
+
+	/* create hash entry */
+	rconn = (remoteConn *) MemoryContextAlloc(TopMemoryContext,
+											  sizeof(remoteConn));
+
+	rconn->conn = conn;
+	snprintf(rconn->host, MAXHOSTLEN - 1, "%s", host);
+	rconn->port = port;
+
+	/* add it to hash map */
 	key = pstrdup(name);
 	truncate_identifier(key, strlen(key), true);
 	hentry = (remoteConnHashEnt *) hash_search(remoteConnHash, key,
