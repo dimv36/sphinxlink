@@ -1,17 +1,39 @@
-#include <dlfcn.h>
-
+/*
+ * sphinxlink.c
+ *
+ * Functions returning results from a remote SphinxSearch (ManticoreSearch) server
+ *
+ * Author: Dmitry Voronin <carriingfate92@yandex.ru>
+ *
+ * contrib/sphinxlink/sphinxlink.c
+ * Copyright (c) 2017 - 2022, Dmitry Voronin
+ * ALL RIGHTS RESERVED;
+ *
+ * Permission to use, copy, modify, and distribute this software and its
+ * documentation for any purpose, without fee, and without a written agreement
+ * is hereby granted, provided that the above copyright notice and this
+ * paragraph and the following two paragraphs appear in all copies.
+ *
+ * IN NO EVENT SHALL THE AUTHOR OR DISTRIBUTORS BE LIABLE TO ANY PARTY FOR
+ * DIRECT, INDIRECT, SPECIAL, INCIDENTAL, OR CONSEQUENTIAL DAMAGES, INCLUDING
+ * LOST PROFITS, ARISING OUT OF THE USE OF THIS SOFTWARE AND ITS
+ * DOCUMENTATION, EVEN IF THE AUTHOR OR DISTRIBUTORS HAVE BEEN ADVISED OF THE
+ * POSSIBILITY OF SUCH DAMAGE.
+ *
+ * THE AUTHOR AND DISTRIBUTORS SPECIFICALLY DISCLAIMS ANY WARRANTIES,
+ * INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY
+ * AND FITNESS FOR A PARTICULAR PURPOSE.  THE SOFTWARE PROVIDED HEREUNDER IS
+ * ON AN "AS IS" BASIS, AND THE AUTHOR AND DISTRIBUTORS HAS NO OBLIGATIONS TO
+ * PROVIDE MAINTENANCE, SUPPORT, UPDATES, ENHANCEMENTS, OR MODIFICATIONS.
+ *
+ */
 #include "postgres.h"
 #include "parser/scansup.h"
-#include "utils/rel.h"
 #include "utils/builtins.h"
-#include "utils/hsearch.h"
-#include "utils/memutils.h"
-#include "catalog/pg_type.h"
 #include "mb/pg_wchar.h"
 #include "miscadmin.h"
 #include "funcapi.h"
-
-#include "sphinxlink.h"
+#include <sphinxlink.h>
 
 PG_MODULE_MAGIC;
 
@@ -34,6 +56,16 @@ typedef struct remoteConn
 } remoteConn;
 
 
+typedef struct storeInfo
+{
+	FunctionCallInfo fcinfo;
+	Tuplestorestate *tuplestore;
+	AttInMetadata *attinmeta;
+	MemoryContext tmpcontext;
+	char	  **cstrs;
+} storeInfo;
+
+
 typedef struct remoteConnHashEnt
 {
 	char		name[NAMEDATALEN];
@@ -47,7 +79,7 @@ typedef struct sphinx_meta_ctx
 } sphinx_meta_ctx;
 
 
-#define SPHINX_INIT \
+#define SPHINXLINK_INIT \
 do { \
 	if (!pconn) \
 	{ \
@@ -59,7 +91,7 @@ do { \
 } while (0)
 
 
-#define SPHINX_GETCONN \
+#define SPHINXLINK_GETCONN \
 do { \
 	conname = text_to_cstring(tconname); \
 	rconn = getConnectionByName(conname); \
@@ -76,14 +108,17 @@ do { \
 
 /* Static functions declaration */
 static TupleDesc createTemplateTupleDescImpl(int nargs);
+static void prepTuplestoreResult(FunctionCallInfo fcinfo);
+static void materializeQueryResult(FunctionCallInfo fcinfo, MYSQL *conn, const char *sql, const char *match_clause);
+static void storeRow(volatile storeInfo *sinfo, MYSQL_ROW row, unsigned int nfields, bool first);
+static bool storeQueryResult(volatile storeInfo *sinfo, MYSQL *conn, const char *sql, const char *match_clause);
 static remoteConn *getConnectionByName(const char *name);
 static HTAB *createConnHash(void);
 static void createNewConnection(const char *name, const char *host, const int port);
 static bool connectionExists(const char *name);
 static void deleteConnection(const char *name);
-static char *toMyDatabaseEncoding(const char *value, bool *freed);
-static char *toUTF8Encoding(const char *value, bool *freed);
-
+static char *toMyDatabaseEncoding(const char *value);
+static char *toUTF8Encoding(const char *value);
 
 /* Module variables declaration */
 static remoteConn *pconn = NULL;
@@ -100,7 +135,7 @@ sphinx_connect(PG_FUNCTION_ARGS)
 	char	   *host = NULL;
 	int			port;
 
-	SPHINX_INIT;
+	SPHINXLINK_INIT;
 
 	conname = text_to_cstring(tconname);
 	host = text_to_cstring(thost);
@@ -129,8 +164,8 @@ sphinx_disconnect(PG_FUNCTION_ARGS)
 	remoteConn *rconn = NULL;
 	MYSQL	   *conn = NULL;
 
-	SPHINX_INIT;
-	SPHINX_GETCONN;
+	SPHINXLINK_INIT;
+	SPHINXLINK_GETCONN;
 
 	mysql_close(conn);
 	conn = NULL;
@@ -248,21 +283,86 @@ sphinx_connections(PG_FUNCTION_ARGS)
 
 PG_FUNCTION_INFO_V1(sphinx_query);
 Datum
-sphinx_query(PG_FUNCTION_ARGS)
+sphinx_query(FunctionCallInfo fcinfo)
 {
-	text			   *tconname = PG_GETARG_TEXT_PP(0);
-	text			   *tquery = PG_GETARG_TEXT_PP(1);
-	char			   *conname = NULL;
-	remoteConn		   *rconn = NULL;
-	MYSQL			   *conn = NULL;
-	MYSQL_RES		   *res = NULL;
-	char			   *query = NULL;
-	int					ntuples;
-	int					nfields;
-	TupleDesc			tupdesc;
-	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	bool				freed;
-	char			   *encoded_query = NULL;
+	MYSQL	   *volatile conn = NULL;
+	remoteConn *rconn = NULL;
+	char	   *match_clause = NULL;
+	char	   *sql = NULL;
+
+	prepTuplestoreResult(fcinfo);
+
+	SPHINXLINK_INIT;
+
+	if (((PG_NARGS() == 3) ||
+		 (PG_NARGS() == 4)) && (get_fn_expr_argtype(fcinfo->flinfo, 1) == INT4OID))
+	{
+		/* text, int, text, text OR text, int, text */
+		StringInfoData	conntmppl;
+		char		   *host = text_to_cstring(PG_GETARG_TEXT_PP(0));
+		int				port = PG_GETARG_INT64(1);
+
+		initStringInfo(&conntmppl);
+
+		appendStringInfo(&conntmppl, "sph-%s-%d", host, port);
+
+		if (!(rconn = getConnectionByName(conntmppl.data)))
+		{
+			createNewConnection(conntmppl.data, host, port);
+			rconn = getConnectionByName(conntmppl.data);
+		}
+		if (strcmp(rconn->host, host) || (rconn->port != port))
+			ereport(ERROR,
+					(errcode(ERRCODE_INTERNAL_ERROR),
+					 errmsg("connection with name \"%s\" already exists, but creadentials are different", conntmppl.data)));
+		else
+			conn = rconn->conn;
+
+		sql = text_to_cstring(PG_GETARG_TEXT_PP(2));
+		if (PG_NARGS() == 4)
+			match_clause = text_to_cstring(PG_GETARG_TEXT_PP(3));
+	}
+	else if (((PG_NARGS() == 2) ||
+			  (PG_NARGS() == 3)) && (get_fn_expr_argtype(fcinfo->flinfo, 1) == TEXTOID))
+	{
+		text	   *tconname = PG_GETARG_TEXT_PP(0);
+		char	   *conname = NULL;
+
+		SPHINXLINK_GETCONN;
+
+		sql = text_to_cstring(PG_GETARG_TEXT_PP(1));
+
+		if (PG_NARGS() == 3)
+			match_clause = text_to_cstring(PG_GETARG_TEXT_PP(2));
+
+		PG_FREE_IF_COPY(tconname, 0);
+	}
+
+	PG_TRY();
+	{
+		materializeQueryResult(fcinfo, conn, sql, match_clause);
+	}
+	PG_CATCH();
+	{
+		PG_RE_THROW();
+	}
+
+	PG_END_TRY();
+
+	return (Datum) 0;
+}
+
+
+/*
+ * Verify function caller can handle a tuplestore result, and set up for that.
+ *
+ * Note: if the caller returns without actually creating a tuplestore, the
+ * executor will treat the function result as an empty set.
+ */
+void
+prepTuplestoreResult(FunctionCallInfo fcinfo)
+{
+	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 
 	/* check to see if query supports us returning a tuplestore */
 	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
@@ -280,453 +380,239 @@ sphinx_query(PG_FUNCTION_ARGS)
 	/* caller must fill these to return a non-empty result */
 	rsinfo->setResult = NULL;
 	rsinfo->setDesc = NULL;
-
-	SPHINX_INIT;
-	SPHINX_GETCONN;
-	query = text_to_cstring(tquery);
-	encoded_query = toUTF8Encoding(query, &freed);
-
-	PG_FREE_IF_COPY(tconname, 0);
-	PG_FREE_IF_COPY(tquery, 1);
-
-	if (mysql_query(conn, encoded_query) != 0)
-	{
-		char	   *err = pstrdup(mysql_error(conn));
-
-		safe_free(encoded_query, freed);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("Error when send query to Sphinx: %s", err)));
-	}
-	safe_free(encoded_query, freed);
-	if ((res = mysql_store_result(conn)) == NULL)
-	{
-		char	    *err = pstrdup(mysql_error(conn));
-
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("Error storing results: %s", err)));
-	}
-	ntuples = mysql_num_rows(res);
-	nfields = mysql_num_fields(res);
-
-	switch (get_call_result_type(fcinfo, NULL, &tupdesc))
-	{
-		case TYPEFUNC_COMPOSITE:
-			/* success */
-			break;
-		case TYPEFUNC_RECORD:
-			/* failed to determine actual type of RECORD */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("function returning record called in context "
-							"that cannot accept type record")));
-			break;
-		default:
-			/* result type isn't composite */
-			elog(ERROR, "return type must be a row type");
-			break;
-	}
-
-	/* make sure we have a persistent copy of the tupdesc */
-	tupdesc = CreateTupleDescCopy(tupdesc);
-
-	/*
-	 * check result and tuple descriptor have the same number of columns
-	 */
-	if (nfields != tupdesc->natts)
-	{
-		if (!ntuples)
-			PG_RETURN_NULL();
-
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("remote query result rowtype does not match "
-						"the specified FROM clause rowtype")));
-	}
-
-	if (ntuples > 0)
-	{
-		AttInMetadata	   *attinmeta;
-		Tuplestorestate	   *tupstore;
-		MYSQL_ROW			row;
-		char			  **values;
-		MemoryContext		oldcontext;
-
-		attinmeta = TupleDescGetAttInMetadata(tupdesc);
-
-		oldcontext = MemoryContextSwitchTo(
-									rsinfo->econtext->ecxt_per_query_memory);
-		tupstore = tuplestore_begin_heap(true, false, work_mem);
-		rsinfo->setDesc = tupdesc;
-		rsinfo->setResult = tupstore;
-		MemoryContextSwitchTo(oldcontext);
-
-		values = (char **) palloc(nfields * sizeof(char *));
-
-		/* put all tuples into the tuplestore */
-		while ((row = mysql_fetch_row(res)))
-		{
-			int			i;
-			HeapTuple	tuple;
-
-			for (i = 0; i < nfields; i++)
-			{
-				char *value = row[i];
-				char *encvalue = NULL;
-
-				if (value == NULL)
-					values[i] = NULL;
-				else
-				{
-					encvalue = toMyDatabaseEncoding(value, &freed);
-					values[i] = pstrdup(encvalue);
-				}
-			}
-
-			/* build the tuple and put it into the tuplestore. */
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* Free results */
-			for (i = 0; i < nfields; i++)
-			{
-				if (values[i])
-					pfree(values[i]);
-			}
-
-			tuplestore_puttuple(tupstore, tuple);
-		}
-
-		pfree(values);
-
-		if (res)
-			mysql_free_result(res);
-
-		/* clean up and return the tuplestore */
-		tuplestore_donestoring(tupstore);
-	}
-	return (Datum) 0;
 }
 
 
-PG_FUNCTION_INFO_V1(sphinx_query_params);
-Datum
-sphinx_query_params(PG_FUNCTION_ARGS)
+/*
+ * Execute query, and send any result rows to sinfo->tuplestore.
+ */
+static bool
+storeQueryResult(volatile storeInfo *sinfo,
+				 MYSQL *conn,
+				 const char *sql,
+				 const char *match_clause)
 {
-	text			   *thost = PG_GETARG_TEXT_PP(0);
-	int					port = PG_GETARG_INT32(1);
-	text			   *tquery = PG_GETARG_TEXT_PP(2);
-	StringInfoData		conname;
-	char			   *host = NULL;
-	remoteConn		   *rconn = NULL;
-	MYSQL			   *conn = NULL;
-	MYSQL_RES		   *res = NULL;
-	char			   *query = NULL;
-	int					ntuples;
-	int					nfields;
-	TupleDesc			tupdesc;
-	ReturnSetInfo	   *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
-	bool				freed;
-	char			   *encoded_query = NULL;
+	bool		first = true;
+	unsigned int nfields = 0;
+	MYSQL_RES   *res;
+	const char  *query = NULL;
+	int			ret = 0;
 
-	/* check to see if query supports us returning a tuplestore */
-	if (rsinfo == NULL || !IsA(rsinfo, ReturnSetInfo))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("set-valued function called in context that cannot accept a set")));
-	if (!(rsinfo->allowedModes & SFRM_Materialize))
-		ereport(ERROR,
-				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-				 errmsg("materialize mode required, but it is not allowed in this context")));
-
-	/* let the executor know we're sending back a tuplestore */
-	rsinfo->returnMode = SFRM_Materialize;
-
-	/* caller must fill these to return a non-empty result */
-	rsinfo->setResult = NULL;
-	rsinfo->setDesc = NULL;
-
-	initStringInfo(&conname);
-
-	SPHINX_INIT;
-
-	host = text_to_cstring(thost);
-	appendStringInfo(&conname, "sph-%s-%d", host, port);
-
-	if (!(rconn = getConnectionByName(conname.data)))
+	if (match_clause)
 	{
-		createNewConnection(conname.data, host, port);
-		rconn = getConnectionByName(conname.data);
+		StringInfoData	buff;
+		char		   *pos = NULL;
+		char		   *escaped = NULL;
+
+		initStringInfo(&buff);
+
+		if ((pos = strstr(sql, "?")))
+		{
+			int			length = strlen(match_clause);
+			int			encoded_length = 0;
+
+			appendBinaryStringInfo(&buff, sql, (pos - sql));
+			appendStringInfoChar(&buff, '\'');
+
+			escaped = (char *) palloc(length * 2 + 1);
+
+			if ((encoded_length = mysql_real_escape_string(conn, escaped, match_clause, length)) < 0)
+				ereport(ERROR,
+						(errcode(ERRCODE_INTERNAL_ERROR),
+						 errmsg("Could not escape clause \"%s\"", match_clause)));
+			appendStringInfo(&buff, "%s')", escaped);
+			pfree(escaped);
+		}
+		query = buff.data;
 	}
-	if (strcmp(rconn->host, host) || (rconn->port != port))
-	{
+	else
+		query = sql;
+
+	if ((ret = mysql_query(conn, toUTF8Encoding(query))))
 		ereport(ERROR,
-				(errcode(ERRCODE_INTERNAL_ERROR),
-				 errmsg("connection with name \"%s\" already exists, but creadentials are different", conname.data)));
-	}
+				(errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+				 errmsg("Could not execute query: %s", mysql_error(conn))));
 
-	conn = rconn->conn;
-	query = text_to_cstring(tquery);
-	encoded_query = toUTF8Encoding(query, &freed);
-
-	PG_FREE_IF_COPY(thost, 0);
-	PG_FREE_IF_COPY(tquery, 2);
-
-	if (mysql_query(conn, encoded_query) != 0)
-	{
-		char	   *err = pstrdup(mysql_error(conn));
-
-		safe_free(encoded_query, freed);
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("Error when send query to Sphinx: %s", err)));
-	}
-	safe_free(encoded_query, freed);
-	if ((res = mysql_store_result(conn)) == NULL)
-	{
-		char	    *err = pstrdup(mysql_error(conn));
-
-		ereport(ERROR,
-				(errcode(ERRCODE_CONNECTION_FAILURE),
-				 errmsg("Error storing results: %s", err)));
-	}
-	ntuples = mysql_num_rows(res);
+	res = mysql_store_result(conn);
 	nfields = mysql_num_fields(res);
 
-	switch (get_call_result_type(fcinfo, NULL, &tupdesc))
+	for (;;)
 	{
-		case TYPEFUNC_COMPOSITE:
-			/* success */
+		MYSQL_ROW	row = NULL;
+
+		CHECK_FOR_INTERRUPTS();
+
+		if (!(row = mysql_fetch_row(res)))
 			break;
-		case TYPEFUNC_RECORD:
-			/* failed to determine actual type of RECORD */
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("function returning record called in context "
-							"that cannot accept type record")));
-			break;
-		default:
-			/* result type isn't composite */
-			elog(ERROR, "return type must be a row type");
-			break;
+
+		/* if empty resultset, fill tuplestore header */
+		storeRow(sinfo, row, nfields, first);
+		if (first)
+			first = false;
 	}
+	if (res)
+		mysql_free_result(res);
 
-	/* make sure we have a persistent copy of the tupdesc */
-	tupdesc = CreateTupleDescCopy(tupdesc);
-
-	/*
-	 * check result and tuple descriptor have the same number of columns
-	 */
-	if (nfields != tupdesc->natts)
-	{
-		if (!ntuples)
-			PG_RETURN_NULL();
-
-		ereport(ERROR,
-				(errcode(ERRCODE_DATATYPE_MISMATCH),
-				 errmsg("remote query result rowtype does not match "
-						"the specified FROM clause rowtype")));
-	}
-
-	if (ntuples > 0)
-	{
-		AttInMetadata	   *attinmeta;
-		Tuplestorestate	   *tupstore;
-		MYSQL_ROW			row;
-		char			  **values;
-		MemoryContext		oldcontext;
-
-		attinmeta = TupleDescGetAttInMetadata(tupdesc);
-
-		oldcontext = MemoryContextSwitchTo(
-									rsinfo->econtext->ecxt_per_query_memory);
-		tupstore = tuplestore_begin_heap(true, false, work_mem);
-		rsinfo->setDesc = tupdesc;
-		rsinfo->setResult = tupstore;
-		MemoryContextSwitchTo(oldcontext);
-
-		values = (char **) palloc(nfields * sizeof(char *));
-
-		/* put all tuples into the tuplestore */
-		while ((row = mysql_fetch_row(res)))
-		{
-			int			i;
-			HeapTuple	tuple;
-
-			for (i = 0; i < nfields; i++)
-			{
-				char *value = row[i];
-				char *encvalue = NULL;
-
-				if (value == NULL)
-					values[i] = NULL;
-				else
-				{
-					encvalue = toMyDatabaseEncoding(value, &freed);
-					values[i] = pstrdup(encvalue);
-				}
-			}
-
-			/* build the tuple and put it into the tuplestore. */
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* Free results */
-			for (i = 0; i < nfields; i++)
-			{
-				if (values[i])
-					pfree(values[i]);
-			}
-
-			tuplestore_puttuple(tupstore, tuple);
-		}
-
-		pfree(values);
-
-		if (res)
-			mysql_free_result(res);
-
-		/* clean up and return the tuplestore */
-		tuplestore_donestoring(tupstore);
-	}
-	return (Datum) 0;
+	return true;
 }
 
-PG_FUNCTION_INFO_V1(sphinx_meta);
-Datum
-sphinx_meta(PG_FUNCTION_ARGS)
+
+/*
+ * Send single row to sinfo->tuplestore.
+ */
+static void
+storeRow(volatile storeInfo *sinfo, MYSQL_ROW row, unsigned int nfields, bool first)
 {
-	FuncCallContext	   *funcctx;
-	int					call_cntr;
-	int					max_calls;
-	TupleDesc			tupdesc;
-	AttInMetadata	   *attinmeta;
-	text			   *tconname = PG_GETARG_TEXT_PP(0);
-	char			   *conname = NULL;
-	remoteConn		   *rconn = NULL;
-	MYSQL			   *conn = NULL;
-	sphinx_meta_ctx	   *fctx = NULL;
+	HeapTuple		tuple;
+	MemoryContext	oldcontext;
+	unsigned int	i;
 
-	SPHINX_INIT;
-	SPHINX_GETCONN;
-
-	PG_FREE_IF_COPY(tconname, 0);
-
-	/* stuff done only on the first call of the function */
-	if (SRF_IS_FIRSTCALL())
+	if (first)
 	{
-		MemoryContext	oldcontext;
-		MYSQL_RES	   *res = NULL;
-		int				ntuples = 0;
-
-		/* create a function context for cross-call persistence */
-		funcctx = SRF_FIRSTCALL_INIT();
-
-		/* switch to memory context appropriate for multiple function calls */
-		oldcontext = MemoryContextSwitchTo(funcctx->multi_call_memory_ctx);
-
-		if (mysql_query(conn, "SHOW META;") != 0)
-		{
-			char	   *err = pstrdup(mysql_error(conn));
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("Error when send query to Sphinx: %s", err)));
-		}
-		if ((res = mysql_store_result(conn)) == NULL)
-		{
-			char	    *err = pstrdup(mysql_error(conn));
-			ereport(ERROR,
-					(errcode(ERRCODE_CONNECTION_FAILURE),
-					 errmsg("Error storing results: %s", err)));
-		}
-		ntuples = mysql_num_rows(res);
-
-		fctx = palloc(sizeof(sphinx_meta_ctx));
-		fctx->res = res;
-
-		funcctx->user_fctx = fctx;
-
-		/* total number of tuples to be returned */
-		funcctx->max_calls = ntuples;
-
-		/* Build a tuple descriptor for our result type */
-		if (get_call_result_type(fcinfo, NULL, &tupdesc) != TYPEFUNC_COMPOSITE)
-			ereport(ERROR,
-					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-					 errmsg("function returning record called in context "
-							"that cannot accept type record")));
+		/* Prepare for new result set */
+		ReturnSetInfo *rsinfo = (ReturnSetInfo *) sinfo->fcinfo->resultinfo;
+		TupleDesc	tupdesc;
 
 		/*
-		 * generate attribute metadata needed later to produce tuples from raw
-		 * C strings
+		 * It's possible to get more than one result set if the query string
+		 * contained multiple SQL commands.  In that case, we follow PQexec's
+		 * traditional behavior of throwing away all but the last result.
 		 */
-		tupdesc = createTemplateTupleDescImpl(2);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 1, "varname",
-						   TEXTOID, -1, 0);
-		TupleDescInitEntry(tupdesc, (AttrNumber) 2, "value",
-						   TEXTOID, -1, 0);
+		if (sinfo->tuplestore)
+			tuplestore_end(sinfo->tuplestore);
+		sinfo->tuplestore = NULL;
 
-		attinmeta = TupleDescGetAttInMetadata(tupdesc);
-		funcctx->attinmeta = attinmeta;
-
-		MemoryContextSwitchTo(oldcontext);
-	}
-
-	/* stuff done on every call of the function */
-	funcctx = SRF_PERCALL_SETUP();
-
-	call_cntr = funcctx->call_cntr;
-	max_calls = funcctx->max_calls;
-	attinmeta = funcctx->attinmeta;
-	fctx = (sphinx_meta_ctx *) funcctx->user_fctx;
-
-	if (call_cntr < max_calls)		/* do when there is more left to send */
-	{
-		char	  **values;
-		HeapTuple	tuple;
-		Datum		result;
-		MYSQL_ROW	row;
-		char	   *encvalue = NULL;
-		bool		freed;
-
-		if ((row = mysql_fetch_row(fctx->res)))
+		/* get a tuple descriptor for our result type */
+		switch (get_call_result_type(sinfo->fcinfo, NULL, &tupdesc))
 		{
-			/*
-			 * Prepare a values array for building the returned tuple.
-			 * This should be an array of C strings which will
-			 * be processed later by the type input functions.
-			 */
-			values = (char **) palloc(2 * sizeof(char *));
-
-			encvalue = toMyDatabaseEncoding(row[0], &freed);
-			values[0] = (char *) pstrdup(encvalue);
-			safe_free(encvalue, freed);
-
-			encvalue = toMyDatabaseEncoding(row[1], &freed);
-			values[1] = (char *) pstrdup(encvalue);
-			safe_free(encvalue, freed);
-
-			tuple = BuildTupleFromCStrings(attinmeta, values);
-
-			/* make the tuple into a datum */
-			result = HeapTupleGetDatum(tuple);
-
-			/* clean up (this is not really necessary) */
-			pfree(values[0]);
-			pfree(values[1]);
-			pfree(values);
-
-			PG_FREE_IF_COPY(conname, 0);
-
-			SRF_RETURN_NEXT(funcctx, result);
+			case TYPEFUNC_COMPOSITE:
+				/* success */
+				break;
+			case TYPEFUNC_RECORD:
+				/* failed to determine actual type of RECORD */
+				ereport(ERROR,
+						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+						 errmsg("function returning record called in context "
+								"that cannot accept type record")));
+				break;
+			default:
+				/* result type isn't composite */
+				elog(ERROR, "return type must be a row type");
+				break;
 		}
-		SRF_RETURN_NEXT(funcctx, (Datum) 0);
+
+		/* make sure we have a persistent copy of the tupdesc */
+		tupdesc = CreateTupleDescCopy(tupdesc);
+
+		/* check result and tuple descriptor have the same number of columns */
+		if (nfields != tupdesc->natts)
+			ereport(ERROR,
+					(errcode(ERRCODE_DATATYPE_MISMATCH),
+					 errmsg("remote query result rowtype does not match "
+							"the specified FROM clause rowtype")));
+
+		/* Prepare attinmeta for later data conversions */
+		sinfo->attinmeta = TupleDescGetAttInMetadata(tupdesc);
+
+		/* Create a new, empty tuplestore */
+		oldcontext = MemoryContextSwitchTo(rsinfo->econtext->ecxt_per_query_memory);
+		sinfo->tuplestore = tuplestore_begin_heap(true, false, work_mem);
+		rsinfo->setResult = sinfo->tuplestore;
+		rsinfo->setDesc = tupdesc;
+		MemoryContextSwitchTo(oldcontext);
+
+		/* Done if empty resultset */
+		if (!row)
+			return;
+
+		/*
+		 * Set up sufficiently-wide string pointers array; this won't change
+		 * in size so it's easy to preallocate.
+		 */
+		if (sinfo->cstrs)
+			pfree(sinfo->cstrs);
+		sinfo->cstrs = (char **) palloc(nfields * sizeof(char *));
 	}
-	else		/* do when there is no more left */
+
+	/*
+	 * Do the following work in a temp context that we reset after each tuple.
+	 * This cleans up not only the data we have direct access to, but any
+	 * cruft the I/O functions might leak.
+	 */
+	oldcontext = MemoryContextSwitchTo(sinfo->tmpcontext);
+
+	/*
+	 * Fill cstrs with null-terminated strings of column values.
+	 */
+	for (i = 0; i < nfields; i++)
 	{
-		if (fctx->res)
-			mysql_free_result(fctx->res);
-		SRF_RETURN_DONE(funcctx);
+		char *value = row[i];
+
+		if (!value)
+			sinfo->cstrs[i] = NULL;
+		else
+			sinfo->cstrs[i] = toMyDatabaseEncoding(value);
 	}
+
+	/* Convert row to a tuple, and add it to the tuplestore */
+	tuple = BuildTupleFromCStrings(sinfo->attinmeta, sinfo->cstrs);
+
+	tuplestore_puttuple(sinfo->tuplestore, tuple);
+
+	/* Clean up */
+	MemoryContextSwitchTo(oldcontext);
+	MemoryContextReset(sinfo->tmpcontext);
+}
+
+
+
+/*
+ * Execute the given SQL command and store its results into a tuplestore
+ * to be returned as the result of the current function.
+ *
+ * This is equivalent to PQexec followed by materializeResult, but we make
+ * use of libpq's single-row mode to avoid accumulating the whole result
+ * inside libpq before it gets transferred to the tuplestore.
+ */
+static void
+materializeQueryResult(FunctionCallInfo fcinfo,
+					   MYSQL *conn,
+					   const char *sql,
+					   const char *match_clause)
+{
+	volatile storeInfo sinfo;
+
+	/* initialize storeInfo to empty */
+	memset((void *) &sinfo, 0, sizeof(sinfo));
+	sinfo.fcinfo = fcinfo;
+
+	PG_TRY();
+	{
+		/* Create short-lived memory context for data conversions */
+		sinfo.tmpcontext = AllocSetContextCreate(CurrentMemoryContext,
+												 "sphinxlink temporary context",
+												 ALLOCSET_DEFAULT_SIZES);
+
+		/* execute query, collecting any tuples into the tuplestore */
+		if (!storeQueryResult(&sinfo, conn, sql, match_clause))
+		{
+			char	   *err = pstrdup(mysql_error(conn));
+
+			ereport(ERROR,
+					(errcode(ERRCODE_SQL_ROUTINE_EXCEPTION),
+					 errmsg("Error when send query to Sphinx: %s", err)));
+		}
+
+		/* clean up data conversion short-lived memory context */
+		if (sinfo.tmpcontext != NULL)
+			MemoryContextDelete(sinfo.tmpcontext);
+		sinfo.tmpcontext = NULL;
+	}
+	PG_CATCH();
+	{
+		PG_RE_THROW();
+	}
+	PG_END_TRY();
 }
 
 
@@ -877,39 +763,32 @@ deleteConnection(const char *name)
 
 
 char *
-toMyDatabaseEncoding(const char *value, bool *freed)
+toMyDatabaseEncoding(const char *value)
 {
 	int		encoding = GetDatabaseEncoding();
 	char   *encoded = NULL;
 
 	if (encoding == PG_UTF8)
-	{
-		*freed = false;
 		return (char *) value;
-	}
-	encoded = (char *) pg_do_encoding_conversion((unsigned char *)value,
+
+	encoded = (char *) pg_do_encoding_conversion((unsigned char *) value,
 												 strlen(value),
 												 PG_UTF8,
 												 encoding);
-	*freed = true;
 	return encoded;
 }
 
 char *
-toUTF8Encoding(const char *value, bool *freed)
+toUTF8Encoding(const char *value)
 {
 	int		encoding = GetDatabaseEncoding();
 	char   *encoded = NULL;
 
 	if ((encoding == PG_UTF8) || (pg_get_client_encoding() != PG_UTF8))
-	{
-		*freed = false;
-		return (char *)value;
-	}
-	encoded = (char *) pg_do_encoding_conversion((unsigned char *)value,
+		return (char *) value;
+	encoded = (char *) pg_do_encoding_conversion((unsigned char *) value,
 												 strlen(value),
 												 encoding,
 												 PG_UTF8);
-	*freed = true;
 	return encoded;
 }
