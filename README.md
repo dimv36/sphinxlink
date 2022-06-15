@@ -8,37 +8,85 @@ This is extension for PostgreSQL which allows you:
 ## Building and installing
 
 The SphinxSearch client message protocol is the same as mysql, so, you need:
-* mysql-client development package (or mariadb-client development package)
-* postgresql development package
-* gcc compiler
-* make utility
+* `mysql-client` development package (or `mariadb-client` development package)
+* `postgresql` development package
+* `gcc` compiler
+* `make` utility
 
 Typical installation procedure may look like this:
     
     $ git clone https://github.com/dimv36/sphinxlink.git
     $ cd sphinxlink
     $ make
-    $ sudo make install
+    $ sudo USE_PGXS=1 make install
     $ psql DB -c "CREATE EXTENSION sphinxlink;"
 
-## HOWTO
+## Functions
 
-The `sphinxlink` extensions provides those functions:
+### Connection/Disconnection
 
-* `sphinx_connect(conname text, host text DEFAULT '127.0.0.1', port integer DEFAULT 9306)` - opens connection to SphinxSearch with connection name `conname`;
-* `sphinx_query(conname text, query text)` - execute query on SphinxSearch connection and get results as table in dblink style (see examples);
-* `sphinx_query_params(host text, port integer, query text)` - opens connection to SphinxSearch (if not opened) and executes query;
-* `sphinx_meta(conname text, OUT varname text, OUT value text)` - get meta inforation about the last search query (it just executes `SHOW META` query on SphinxSearch and return table-based result);
-* `sphinx_connections(OUT conname text, OUT host text, OUT port integer)` - get information about all opened connections in this session;
-* sphinx_disconnect(conname text) - close connection to SphinxSearch by name conname.
+For connection/disconnection to (from) SphinxSearch server use those functions:
 
-## Examples
+    sphinx_connect(conname text, host text DEFAULT '127.0.0.1', port integer DEFAULT 9306)
+    sphinx_disconnect(conname text)
+    
+e.g.:
+ 
+    SELECT sphinx_connect('myconn', '192.168.1.1');
+    SELECT sphinx_disconnect('myconn');
+    
+To get already opened connections use function `sphinx_connections()`:
 
-    > SELECT sphinx_connect('myconn', '192.168.1.1');
-    > SELECT * FROM sphinx_query('myconn', 'SELECT weight(), mydata FROM myindex WHERE MATCH(''some&interesting'')') AS 
-    (weight integer, mydata text);
-    > SELECT * FROM sphinx_meta('myconn');
-    > SELECT sphinx_disconnect('myconn');
+    sphinx_connections(conname text, OUT host text, OUT integer port)
+    
+ e.g.:
+
+    SELECT * FROM sphinx_connections();
+    
+### Execute queries and returning stat
+
+If you have already opened connection, use function `sphinx_query`:
+
+    sphinx_query(conname text, query text)
+    
+e.g.:
+
+    SELECT docid FROM sphinx_query('myconn', 'SELECT docid FROM my_index WHERE MATCH(''Something&interesting'')' AS ss (docid integer);
+    
+If you want that extension automatically opens connection to SphinxSearch and execute query, use function `sphinx_query_params`:
+
+    sphinx_query(host text, port integer, query text)
+
+e.g.:
+
+    SELECT docid FROM sphinx_query_params('192.168.1.1', 9306, 'SELECT docid FROM my_index WHERE MATCH(''Something&interesting'')' AS ss (docid integer);
+ 
+ To get query stat, use functions `sphinx_meta()` and `sphinx_meta_params()`:
+ 
+    sphinx_meta(conname text)
+    sphinx_meta_params(host text, port integer)
+    
+Those function return execution stats of last query as `TABLE(varname text, value text)`
+  
+### Execute formatted queries
+
+Extension also provides functions `sphinx_query()` and `sphinx_query_params()` with extra parameter `match_clause`:
+
+    sphinx_query(conname text, query text, match_clause text)
+    sphinx_query_params(host text, port integer, query text, match_clause text)
+ 
+ Those functions have deal with parametrized queries in `query` argument, e.g.:
+ 
+    SELECT docid FROM my_index WHERE MATCH(?)
+    
+ with `match_clause='Something&interesting'` will be executed as:
+ 
+    SELECT docid FROM my_index WHERE MATCH('Something&interesting')
+    
+ Full example:
+ 
+    SELECT * FROM sphinx_query('conn', 'SELECT docid FROM my_index WHERE MATCH(?)', 'Something&interesting') AS ss (docid integer);
+    SELECT * FROM sphinx_query_params('127.0.0.1', 9306, 'SELECT docid FROM my_index WHERE MATCH(?)', 'Something&interesting') AS ss (docid integer);
     
 ## Authors
 Dmitry Voronin <carriingfate92@yandex.ru>
