@@ -406,13 +406,12 @@ storeQueryResult(volatile storeInfo *sinfo,
 
 		initStringInfo(&buff);
 
-		if ((pos = strstr(sql, "?")))
+		if ((pos = strstr(sql, "MATCH(?)")))
 		{
 			int			length = strlen(match_clause);
 			int			encoded_length = 0;
 
 			appendBinaryStringInfo(&buff, sql, (pos - sql));
-			appendStringInfoChar(&buff, '\'');
 
 			escaped = (char *) palloc(length * 2 + 1);
 
@@ -420,7 +419,10 @@ storeQueryResult(volatile storeInfo *sinfo,
 				ereport(ERROR,
 						(errcode(ERRCODE_INTERNAL_ERROR),
 						 errmsg("Could not escape clause \"%s\"", match_clause)));
-			appendStringInfo(&buff, "%s')", escaped);
+			appendStringInfo(&buff, "MATCH('%s')", escaped);
+			pos += 8;
+			if (pos)
+				appendStringInfoString(&buff, pos);
 			pfree(escaped);
 		}
 		query = buff.data;
