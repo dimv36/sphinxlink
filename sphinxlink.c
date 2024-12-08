@@ -673,6 +673,7 @@ createNewConnection(const char *name,
 	MYSQL		   *conn = NULL;
 	remoteConn	   *rconn = NULL;
 	int				reconnect = 1;
+	my_bool			disabled = 0;
 
 	if (!remoteConnHash)
 		remoteConnHash = createConnHash();
@@ -689,6 +690,8 @@ createNewConnection(const char *name,
 	/* Sphinx only works with UTF8, so make connection with it */
 	mysql_options(conn, MYSQL_SET_CHARSET_NAME, "UTF8");
 	mysql_options(conn, MYSQL_OPT_RECONNECT, &reconnect);
+	/* MDEV-31857: enable MYSQL_OPT_SSL_VERIFY_SERVER_CERT by default */
+	mysql_options(conn, MYSQL_OPT_SSL_VERIFY_SERVER_CERT, &disabled);
 
 	if (!mysql_real_connect(conn, host, NULL, NULL, NULL, port, NULL, 0))
 	{
